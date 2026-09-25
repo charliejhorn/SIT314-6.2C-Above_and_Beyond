@@ -1,0 +1,9 @@
+.DS_Store
+.cache/
+.env
+.vscode/
+*.log
+node_modules/
+dist/
+.postman/
+.next/
