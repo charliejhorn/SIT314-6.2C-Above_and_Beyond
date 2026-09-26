@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
+import { MongoClient } from "mongodb";
 
 const app = express();
 const port = process.env.EDGE_NODE_PORT || 3000;
@@ -8,14 +8,21 @@ const HVAC_NODE_PORT = process.env.HVAC_NODE_PORT || 3001;
 const HVAC_INTERVAL = process.env.HVAC_INTERVAL || 5000;
 const TARGET_TEMP = process.env.TARGET_TEMP || 20;
 const TARGET_HUMIDITY = process.env.TARGET_HUMIDITY || 50;
-const ROOM_IDS = (process.env.ROOM_IDS || '101,102,103').split(',');
+const ROOM_IDS = (process.env.ROOM_IDS || '101,102,103').split(',').map(room_id => room_id.trim());
 
 const mongoUri = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/express_app";
 
 const client = new MongoClient(mongoUri);
 
 let readings;
+let hvacStatusRecords;
 let hvacStatuses = {};
+
+const defaultHvacStatus = {
+    heater: 'off',
+    aircon: 'off',
+    windows: 'closed'
+};
 
 app.use(express.json());
 app.use((req, _res, next) => {
@@ -39,15 +46,14 @@ app.post('/sensor/readings', async (req, res) => {
             });
         }
 
-        fields.map(field => {
-            if(data[field] == undefined) {
-                console.error(`Received incomplete data (missing field '${field}'):`, data);
-                return res.status(400).json({ 
-                    status: 'error', 
-                    message: `Missing field ${field}.` 
-                });
-            }
-        })
+        const missingField = fields.find(field => data[field] === undefined);
+        if (missingField) {
+            console.error(`Received incomplete data (missing field '${missingField}'):`, data);
+            return res.status(400).json({
+                status: 'error',
+                message: `Missing field ${missingField}.`
+            });
+        }
     
         const reading = {
             timestamp: data.timestamp,
@@ -66,7 +72,7 @@ app.post('/sensor/readings', async (req, res) => {
         // Successful response: Send a 201 Created or 200 OK status
         res.status(201).json({  
             ...reading,
-            _id: result.inseredId
+            _id: result.insertedId
         });
     } catch (error) {
         console.error(error);
@@ -107,18 +113,21 @@ app.get('/sensor/readings', async (req, res) => {
 });
 
 async function manageHvacInRoom(room_id) {
-    console.log(`Managing HVAC for room ${room_id}...`);
+    // console.log(`Managing HVAC for room ${room_id}...`);
     // get most recent reading for the room
-    const recentReading = await readings.find({ room_id: room_id }).sort({ timestamp: -1 }).limit(1).toArray();
-    const currentHvacStatus = hvacStatuses[room_id] || { heater: 'off', aircon: 'off', windows: 'closed' };
+    const recentReading = await readings.findOne(
+        { room_id: room_id },
+        { sort: { timestamp: -1 } }
+    );
+    const currentHvacStatus = hvacStatuses[room_id] || { ...defaultHvacStatus };
     const newHvacStatus = { ...currentHvacStatus };
 
     // trigger a specific command based on the readings
     // we have temperature, humidity, human_activity_level, and co2
     // can open/close windows, turn on/off heater, turn on/off aircon
     if (recentReading) {
-        console.log(`Recent reading for room ${room_id}:`, recentReading);
-        console.log(`${room_id}: cold enough for heater (temp < 20): ${recentReading.temp < 20}, hot enough for aircon (temp > 25): ${recentReading.temp > 25}, high humidity: ${recentReading.humidity > 60}, high CO2: ${recentReading.co2 > 1000}, high activity: ${recentReading.human_activity_level > 50}`);
+        // console.log(`Recent reading for room ${room_id}:`, recentReading);
+        // console.log(`${room_id}: cold enough for heater (temp < 20): ${recentReading.temp < 20}, hot enough for aircon (temp > 25): ${recentReading.temp > 25}, high humidity: ${recentReading.humidity > 60}, high CO2: ${recentReading.co2 > 1000}, high activity: ${recentReading.human_activity_level > 50}`);
         if (recentReading.temp > 25) {
             newHvacStatus.aircon = 'on';
             newHvacStatus.heater = 'off';
@@ -142,21 +151,47 @@ async function manageHvacInRoom(room_id) {
     // console.log("New HVAC status:", newHvacStatus);
 
     // check if statuses have changed, if so, send commands to HVAC node
+    const statusChanges = [];
     if (newHvacStatus.heater !== currentHvacStatus.heater) {
-        setHvacStatus(room_id, 'heater', newHvacStatus.heater);
-        console.log(`Heater status for room ${room_id} changed from ${currentHvacStatus.heater} to ${newHvacStatus.heater}`);
+        statusChanges.push(['heater', newHvacStatus.heater]);
+        // console.log(`Heater status for room ${room_id} changed from ${currentHvacStatus.heater} to ${newHvacStatus.heater}`);
     }
     if (newHvacStatus.aircon !== currentHvacStatus.aircon) {
-        setHvacStatus(room_id, 'aircon', newHvacStatus.aircon);
-        console.log(`Aircon status for room ${room_id} changed from ${currentHvacStatus.aircon} to ${newHvacStatus.aircon}`);
+        statusChanges.push(['aircon', newHvacStatus.aircon]);
+        // console.log(`Aircon status for room ${room_id} changed from ${currentHvacStatus.aircon} to ${newHvacStatus.aircon}`);
     }
     if (newHvacStatus.windows !== currentHvacStatus.windows) {
-        setHvacStatus(room_id, 'windows', newHvacStatus.windows);
-        console.log(`Windows status for room ${room_id} changed from ${currentHvacStatus.windows} to ${newHvacStatus.windows}`);
+        statusChanges.push(['windows', newHvacStatus.windows]);
+        // console.log(`Windows status for room ${room_id} changed from ${currentHvacStatus.windows} to ${newHvacStatus.windows}`);
     }
 
-    // update the local status
-    hvacStatuses[room_id] = newHvacStatus;
+    const results = await Promise.all(
+        statusChanges.map(async ([device, status]) => ({
+            device,
+            status,
+            succeeded: await setHvacStatus(room_id, device, status)
+        }))
+    );
+
+    hvacStatuses[room_id] = { ...currentHvacStatus };
+    for (const result of results) {
+        if (result.succeeded) {
+            hvacStatuses[room_id][result.device] = result.status;
+            await hvacStatusRecords.updateOne(
+                { room_id },
+                {
+                    $set: {
+                        [result.device]: result.status,
+                        updatedAt: new Date()
+                    },
+                    $setOnInsert: {
+                        room_id
+                    }
+                },
+                { upsert: true }
+            );
+        }
+    }
 }
 
 async function setHvacStatus(room_id, device, status) {
@@ -176,13 +211,16 @@ async function setHvacStatus(room_id, device, status) {
 
         if (response.ok) {
             console.log(`    Success (${room_id}): ${device} set to ${status}`);
+            return true;
         } else {
             // Handle specific error codes from the server
             console.error(`    Error (${room_id}): ${result.message}`);
+            return false;
         }
     } catch (error) {
         // Handle network or server connection failures
         console.error(`    Network Failure (${room_id}): Could not connect to HVAC node.`, error.message);
+        return false;
     }
 }
 
@@ -208,16 +246,39 @@ async function getHvacStatus(room_id) {
 }
 
 async function initialiseHvacStatuses() {
-    // get the current status of the HVAC for each room
-    // store the status in a local variable
     for (const room_id of ROOM_IDS) {
-        const status = await getHvacStatus(room_id);
-        if (status) {
-            hvacStatuses[room_id] = status;
-            console.log(`Initialised HVAC status for room ${room_id}:`, status);
-        } else {
-            console.error(`Failed to initialise HVAC status for room ${room_id}`);
-        }
+        const storedStatus = await hvacStatusRecords.findOne({ room_id });
+        const remoteStatus = await getHvacStatus(room_id);
+        const status = {
+            room_id,
+            ...defaultHvacStatus,
+            ...(storedStatus || {}),
+            ...(remoteStatus || {})
+        };
+
+        hvacStatuses[room_id] = {
+            heater: status.heater,
+            aircon: status.aircon,
+            windows: status.windows
+        };
+
+        await hvacStatusRecords.updateOne(
+            { room_id },
+            {
+                $set: {
+                    heater: status.heater,
+                    aircon: status.aircon,
+                    windows: status.windows,
+                    updatedAt: new Date()
+                },
+                $setOnInsert: {
+                    room_id,
+                    createdAt: new Date()
+                }
+            },
+            { upsert: true }
+        );
+        console.log(`Initialised HVAC status for room ${room_id}:`, hvacStatuses[room_id]);
     }
 }
 
@@ -229,6 +290,8 @@ async function startServer() {
 
         const database = client.db();
         readings = database.collection("readings");
+        hvacStatusRecords = database.collection("hvac_statuses");
+        await hvacStatusRecords.createIndex({ room_id: 1 }, { unique: true });
         console.log("Connected to MongoDB");
 
         console.log("Initialising HVAC statuses...");
@@ -238,9 +301,13 @@ async function startServer() {
             console.log(`Edge node server running at http://localhost:${port}`);
         });
 
-        setInterval(() => {
+        setInterval(async () => {
             for (const room_id of ROOM_IDS) {
-                manageHvacInRoom(room_id);
+                try {
+                    await manageHvacInRoom(room_id);
+                } catch (error) {
+                    console.error(`Failed to manage HVAC for room ${room_id}:`, error);
+                }
             }
         }, HVAC_INTERVAL);
 
