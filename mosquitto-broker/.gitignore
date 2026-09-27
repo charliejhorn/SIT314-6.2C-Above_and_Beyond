@@ -1,0 +1,7 @@
+# Sensitive files
+data/password_file
+data/mosquitto.db
+log/
+
+# Optional: ignore all data
+data/
